@@ -16,13 +16,16 @@ COPY . .
 RUN make cloudflared
 
 # use a distroless base image with glibc
-FROM gcr.io/distroless/base-debian10:nonroot
+FROM docker.io/arm64v8/alpine
 
 # copy our compiled binary
-COPY --from=builder --chown=nonroot /go/src/github.com/cloudflare/cloudflared/cloudflared /usr/local/bin/
+COPY --from=builder /go/src/github.com/cloudflare/cloudflared/cloudflared /usr/local/bin/
 
-# run as non-privileged user
+RUN adduser -D nonroot
+
 USER nonroot
+
+VOLUME [ "/home/nonroot/.cloudflared", "/etc/cloudflared" ]
 
 # command / entrypoint of container
 ENTRYPOINT ["cloudflared", "--no-autoupdate"]
