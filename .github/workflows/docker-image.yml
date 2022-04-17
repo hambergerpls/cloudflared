@@ -30,4 +30,5 @@ jobs:
         uses: docker/build-push-action@v2
         with:
           push: true
+          platforms: linux/arm64
           tags: hambergerpls/cloudflared:latest-arm64
