@@ -117,7 +117,7 @@ func (c *HTTP2Connection) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch connType {
 	case TypeControlStream:
-		if err := c.controlStreamHandler.ServeControlStream(r.Context(), respWriter, c.connOptions); err != nil {
+		if err := c.controlStreamHandler.ServeControlStream(r.Context(), respWriter, c.connOptions, c.orchestrator); err != nil {
 			c.controlStreamErr = err
 			c.log.Error().Err(err)
 			respWriter.WriteErrorResponse()
@@ -229,6 +229,12 @@ func (rp *http2RespWriter) WriteRespHeaders(status int, header http.Header) erro
 			// This header has meaning in HTTP/2 and will be used by the edge,
 			// so it should be sent *also* as an HTTP/2 response header.
 			dest[name] = values
+		}
+
+		if h2name == tracing.IntCloudflaredTracingHeader {
+			// Add cf-int-cloudflared-tracing header outside of serialized userHeaders
+			rp.w.Header()[tracing.CanonicalCloudflaredTracingHeader] = values
+			continue
 		}
 
 		if !IsControlResponseHeader(h2name) || IsWebsocketClientHeader(h2name) {

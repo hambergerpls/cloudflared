@@ -18,6 +18,7 @@ import (
 	"golang.org/x/crypto/ssh/terminal"
 
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/cliutil"
+	"github.com/cloudflare/cloudflared/edgediscovery/allregions"
 
 	"github.com/cloudflare/cloudflared/config"
 	"github.com/cloudflare/cloudflared/connection"
@@ -41,7 +42,10 @@ var (
 
 	LogFieldHostname = "hostname"
 
-	secretFlags = [2]*altsrc.StringFlag{credentialsContentsFlag, tunnelTokenFlag}
+	secretFlags     = [2]*altsrc.StringFlag{credentialsContentsFlag, tunnelTokenFlag}
+	defaultFeatures = []string{supervisor.FeatureAllowRemoteConfig, supervisor.FeatureSerializedHeaders}
+
+	configFlags = []string{"autoupdate-freq", "no-autoupdate", "retries", "protocol", "loglevel", "transport-loglevel", "origincert", "metrics", "metrics-update-freq", "edge-ip-version"}
 )
 
 // returns the first path that contains a cert.pem file. If none of the DefaultConfigSearchDirectories
@@ -225,7 +229,7 @@ func prepareTunnelConfig(
 			return nil, nil, errors.Wrap(err, "can't generate connector UUID")
 		}
 		log.Info().Msgf("Generated Connector ID: %s", clientUUID)
-		features := append(c.StringSlice("features"), supervisor.FeatureSerializedHeaders)
+		features := append(c.StringSlice("features"), defaultFeatures...)
 		if c.IsSet(TunnelTokenFlag) {
 			if transportProtocol == connection.AutoSelectFlag {
 				protocolFetcher = func() (edgediscovery.ProtocolPercents, error) {
@@ -243,7 +247,6 @@ func prepareTunnelConfig(
 					return preferQuic, nil
 				}
 			}
-			features = append(features, supervisor.FeatureAllowRemoteConfig)
 			log.Info().Msg("Will be fetching remotely managed configuration from Cloudflare API. Defaulting to protocol: quic")
 		}
 		namedTunnel.Client = tunnelpogs.ClientInfo{
@@ -322,6 +325,10 @@ func prepareTunnelConfig(
 		CompressionSetting: h2mux.CompressionSetting(uint64(c.Int("compression-quality"))),
 		MetricsUpdateFreq:  c.Duration("metrics-update-freq"),
 	}
+	edgeIPVersion, err := parseConfigIPVersion(c.String("edge-ip-version"))
+	if err != nil {
+		return nil, nil, err
+	}
 
 	tunnelConfig := &supervisor.TunnelConfig{
 		GracePeriod:     gracePeriod,
@@ -330,6 +337,7 @@ func prepareTunnelConfig(
 		ClientID:        clientID,
 		EdgeAddrs:       c.StringSlice("edge"),
 		Region:          c.String("region"),
+		EdgeIPVersion:   edgeIPVersion,
 		HAConnections:   c.Int("ha-connections"),
 		IncidentLookup:  supervisor.NewIncidentLookup(),
 		IsAutoupdated:   c.Bool("is-autoupdated"),
@@ -348,11 +356,24 @@ func prepareTunnelConfig(
 		ProtocolSelector: protocolSelector,
 		EdgeTLSConfigs:   edgeTLSConfigs,
 	}
-	dynamicConfig := &orchestration.Config{
+	orchestratorConfig := &orchestration.Config{
 		Ingress:            &ingressRules,
-		WarpRoutingEnabled: warpRoutingEnabled,
+		WarpRouting:        ingress.NewWarpRoutingConfig(&cfg.WarpRouting),
+		ConfigurationFlags: parseConfigFlags(c),
 	}
-	return tunnelConfig, dynamicConfig, nil
+	return tunnelConfig, orchestratorConfig, nil
+}
+
+func parseConfigFlags(c *cli.Context) map[string]string {
+	result := make(map[string]string)
+
+	for _, flag := range configFlags {
+		if v := c.String(flag); c.IsSet(flag) && v != "" {
+			result[flag] = v
+		}
+	}
+
+	return result
 }
 
 func gracePeriod(c *cli.Context) (time.Duration, error) {
@@ -388,4 +409,19 @@ func dedup(slice []string) []string {
 		i++
 	}
 	return keys
+}
+
+// ParseConfigIPVersion returns the IP version from possible expected values from config
+func parseConfigIPVersion(version string) (v allregions.ConfigIPVersion, err error) {
+	switch version {
+	case "4":
+		v = allregions.IPv4Only
+	case "6":
+		v = allregions.IPv6Only
+	case "auto":
+		v = allregions.Auto
+	default: // unspecified or invalid
+		err = fmt.Errorf("invalid value for edge-ip-version: %s", version)
+	}
+	return
 }

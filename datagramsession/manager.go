@@ -2,6 +2,7 @@ package datagramsession
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"time"
 
@@ -16,6 +17,10 @@ const (
 	defaultReqTimeout   = time.Second * 5
 )
 
+var (
+	errSessionManagerClosed = fmt.Errorf("session manager closed")
+)
+
 // Manager defines the APIs to manage sessions from the same transport.
 type Manager interface {
 	// Serve starts the event loop
@@ -24,12 +29,15 @@ type Manager interface {
 	RegisterSession(ctx context.Context, sessionID uuid.UUID, dstConn io.ReadWriteCloser) (*Session, error)
 	// UnregisterSession stops tracking the session and terminates it
 	UnregisterSession(ctx context.Context, sessionID uuid.UUID, message string, byRemote bool) error
+	// UpdateLogger updates the logger used by the Manager
+	UpdateLogger(log *zerolog.Logger)
 }
 
 type manager struct {
 	registrationChan   chan *registerSessionEvent
 	unregistrationChan chan *unregisterSessionEvent
 	datagramChan       chan *newDatagram
+	closedChan         chan struct{}
 	transport          transport
 	sessions           map[uuid.UUID]*Session
 	log                *zerolog.Logger
@@ -43,11 +51,17 @@ func NewManager(transport transport, log *zerolog.Logger) *manager {
 		unregistrationChan: make(chan *unregisterSessionEvent),
 		// datagramChan is buffered, so it can read more datagrams from transport while the event loop is processing other events
 		datagramChan: make(chan *newDatagram, requestChanCapacity),
+		closedChan:   make(chan struct{}),
 		transport:    transport,
 		sessions:     make(map[uuid.UUID]*Session),
 		log:          log,
 		timeout:      defaultReqTimeout,
 	}
+}
+
+func (m *manager) UpdateLogger(log *zerolog.Logger) {
+	// Benign data race, no problem if the old pointer is read or not concurrently.
+	m.log = log
 }
 
 func (m *manager) Serve(ctx context.Context) error {
@@ -90,7 +104,24 @@ func (m *manager) Serve(ctx context.Context) error {
 			}
 		}
 	})
-	return errGroup.Wait()
+	err := errGroup.Wait()
+	close(m.closedChan)
+	m.shutdownSessions(err)
+	return err
+}
+
+func (m *manager) shutdownSessions(err error) {
+	if err == nil {
+		err = errSessionManagerClosed
+	}
+	closeSessionErr := &errClosedSession{
+		message: err.Error(),
+		// Usually connection with remote has been closed, so set this to true to skip unregistering from remote
+		byRemote: true,
+	}
+	for _, s := range m.sessions {
+		s.close(closeSessionErr)
+	}
 }
 
 func (m *manager) RegisterSession(ctx context.Context, sessionID uuid.UUID, originProxy io.ReadWriteCloser) (*Session, error) {
@@ -104,13 +135,31 @@ func (m *manager) RegisterSession(ctx context.Context, sessionID uuid.UUID, orig
 	case m.registrationChan <- event:
 		session := <-event.resultChan
 		return session, nil
+	// Once closedChan is closed, manager won't accept more registration because nothing is
+	// reading from registrationChan and it's an unbuffered channel
+	case <-m.closedChan:
+		return nil, errSessionManagerClosed
 	}
 }
 
 func (m *manager) registerSession(ctx context.Context, registration *registerSessionEvent) {
-	session := newSession(registration.sessionID, m.transport, registration.originProxy, m.log)
+	session := m.newSession(registration.sessionID, registration.originProxy)
 	m.sessions[registration.sessionID] = session
 	registration.resultChan <- session
+}
+
+func (m *manager) newSession(id uuid.UUID, dstConn io.ReadWriteCloser) *Session {
+	return &Session{
+		ID:        id,
+		transport: m.transport,
+		dstConn:   dstConn,
+		// activeAtChan has low capacity. It can be full when there are many concurrent read/write. markActive() will
+		// drop instead of blocking because last active time only needs to be an approximation
+		activeAtChan: make(chan time.Time, 2),
+		// capacity is 2 because close() and dstToTransport routine in Serve() can write to this channel
+		closeChan: make(chan error, 2),
+		log:       m.log,
+	}
 }
 
 func (m *manager) UnregisterSession(ctx context.Context, sessionID uuid.UUID, message string, byRemote bool) error {
@@ -129,6 +178,8 @@ func (m *manager) UnregisterSession(ctx context.Context, sessionID uuid.UUID, me
 		return ctx.Err()
 	case m.unregistrationChan <- event:
 		return nil
+	case <-m.closedChan:
+		return errSessionManagerClosed
 	}
 }
 

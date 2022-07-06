@@ -91,7 +91,8 @@ func (o httpService) MarshalJSON() ([]byte, error) {
 // rawTCPService dials TCP to the destination specified by the client
 // It's used by warp routing
 type rawTCPService struct {
-	name string
+	name   string
+	dialer net.Dialer
 }
 
 func (o *rawTCPService) String() string {
@@ -109,9 +110,11 @@ func (o rawTCPService) MarshalJSON() ([]byte, error) {
 // tcpOverWSService models TCP origins serving eyeballs connecting over websocket, such as
 // cloudflared access commands.
 type tcpOverWSService struct {
+	scheme        string
 	dest          string
 	isBastion     bool
 	streamHandler streamHandlerFunc
+	dialer        net.Dialer
 }
 
 type socksProxyOverWSService struct {
@@ -130,7 +133,8 @@ func newTCPOverWSService(url *url.URL) *tcpOverWSService {
 		addPortIfMissing(url, 7864) // just a random port since there isn't a default in this case
 	}
 	return &tcpOverWSService{
-		dest: url.Host,
+		scheme: url.Scheme,
+		dest:   url.Host,
 	}
 }
 
@@ -160,7 +164,12 @@ func (o *tcpOverWSService) String() string {
 	if o.isBastion {
 		return ServiceBastion
 	}
-	return o.dest
+
+	if o.scheme != "" {
+		return fmt.Sprintf("%s://%s", o.scheme, o.dest)
+	} else {
+		return o.dest
+	}
 }
 
 func (o *tcpOverWSService) start(log *zerolog.Logger, _ <-chan struct{}, cfg OriginRequestConfig) error {
@@ -169,6 +178,8 @@ func (o *tcpOverWSService) start(log *zerolog.Logger, _ <-chan struct{}, cfg Ori
 	} else {
 		o.streamHandler = DefaultStreamHandler
 	}
+	o.dialer.Timeout = cfg.ConnectTimeout.Duration
+	o.dialer.KeepAlive = cfg.TCPKeepAlive.Duration
 	return nil
 }
 
@@ -231,20 +242,15 @@ func (o helloWorld) MarshalJSON() ([]byte, error) {
 // statusCode is an OriginService that just responds with a given HTTP status.
 // Typical use-case is "user wants the catch-all rule to just respond 404".
 type statusCode struct {
-	resp *http.Response
+	code int
 }
 
 func newStatusCode(status int) statusCode {
-	resp := &http.Response{
-		StatusCode: status,
-		Status:     fmt.Sprintf("%d %s", status, http.StatusText(status)),
-		Body:       new(NopReadCloser),
-	}
-	return statusCode{resp: resp}
+	return statusCode{code: status}
 }
 
 func (o *statusCode) String() string {
-	return fmt.Sprintf("http_status:%d", o.resp.StatusCode)
+	return fmt.Sprintf("http_status:%d", o.code)
 }
 
 func (o *statusCode) start(
@@ -284,6 +290,7 @@ func newHTTPTransport(service OriginService, cfg OriginRequestConfig, log *zerol
 		TLSHandshakeTimeout:   cfg.TLSTimeout.Duration,
 		ExpectContinueTimeout: 1 * time.Second,
 		TLSClientConfig:       &tls.Config{RootCAs: originCertPool, InsecureSkipVerify: cfg.NoTLSVerify},
+		ForceAttemptHTTP2:     cfg.Http2Origin,
 	}
 	if _, isHelloWorld := service.(*helloWorld); !isHelloWorld && cfg.OriginServerName != "" {
 		httpTransport.TLSClientConfig.ServerName = cfg.OriginServerName

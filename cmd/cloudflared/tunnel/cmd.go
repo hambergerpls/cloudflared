@@ -15,6 +15,7 @@ import (
 	"github.com/coreos/go-systemd/daemon"
 	"github.com/facebookgo/grace/gracenet"
 	"github.com/getsentry/raven-go"
+	"github.com/google/uuid"
 	homedir "github.com/mitchellh/go-homedir"
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog"
@@ -343,13 +344,21 @@ func StartServer(
 		observer.SendURL(quickTunnelURL)
 	}
 
-	tunnelConfig, dynamicConfig, err := prepareTunnelConfig(c, info, log, logTransport, observer, namedTunnel)
+	tunnelConfig, orchestratorConfig, err := prepareTunnelConfig(c, info, log, logTransport, observer, namedTunnel)
 	if err != nil {
 		log.Err(err).Msg("Couldn't start tunnel")
 		return err
 	}
+	var clientID uuid.UUID
+	if tunnelConfig.NamedTunnel != nil {
+		clientID, err = uuid.FromBytes(tunnelConfig.NamedTunnel.Client.ClientID)
+		if err != nil {
+			// set to nil for classic tunnels
+			clientID = uuid.Nil
+		}
+	}
 
-	orchestrator, err := orchestration.NewOrchestrator(ctx, dynamicConfig, tunnelConfig.Tags, tunnelConfig.Log)
+	orchestrator, err := orchestration.NewOrchestrator(ctx, orchestratorConfig, tunnelConfig.Tags, tunnelConfig.Log)
 	if err != nil {
 		return err
 	}
@@ -363,7 +372,7 @@ func StartServer(
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		readinessServer := metrics.NewReadyServer(log)
+		readinessServer := metrics.NewReadyServer(log, clientID)
 		observer.RegisterSink(readinessServer)
 		errC <- metrics.ServeMetrics(metricsListener, ctx.Done(), readinessServer, quickTunnelURL, orchestrator, log)
 	}()
@@ -388,7 +397,7 @@ func StartServer(
 			info.Version(),
 			hostname,
 			metricsListener.Addr().String(),
-			dynamicConfig.Ingress,
+			orchestratorConfig.Ingress,
 			tunnelConfig.HAConnections,
 		)
 		app := tunnelUI.Launch(ctx, log, logTransport)
@@ -513,6 +522,13 @@ func tunnelFlags(shouldHide bool) []cli.Flag {
 			Name:    "region",
 			Usage:   "Cloudflare Edge region to connect to. Omit or set to empty to connect to the global region.",
 			EnvVars: []string{"TUNNEL_REGION"},
+		}),
+		altsrc.NewStringFlag(&cli.StringFlag{
+			Name:    "edge-ip-version",
+			Usage:   "Cloudflare Edge ip address version to connect with. {4, 6, auto}",
+			EnvVars: []string{"TUNNEL_EDGE_IP_VERSION"},
+			Value:   "4",
+			Hidden:  false,
 		}),
 		altsrc.NewStringFlag(&cli.StringFlag{
 			Name:    tlsconfig.CaCertFlag,
@@ -820,6 +836,13 @@ func configureProxyFlags(shouldHide bool) []cli.Flag {
 			Usage:   legacyTunnelFlag("Disables chunked transfer encoding; useful if you are running a WSGI server."),
 			EnvVars: []string{"TUNNEL_NO_CHUNKED_ENCODING"},
 			Hidden:  shouldHide,
+		}),
+		altsrc.NewBoolFlag(&cli.BoolFlag{
+			Name:    ingress.Http2OriginFlag,
+			Usage:   "Enables HTTP/2 origin servers.",
+			EnvVars: []string{"TUNNEL_ORIGIN_ENABLE_HTTP2"},
+			Hidden:  shouldHide,
+			Value:   false,
 		}),
 	}
 	return append(flags, sshFlags(shouldHide)...)

@@ -12,10 +12,11 @@ import (
 )
 
 var (
-	defaultConnectTimeout   = config.CustomDuration{Duration: 30 * time.Second}
-	defaultTLSTimeout       = config.CustomDuration{Duration: 10 * time.Second}
-	defaultTCPKeepAlive     = config.CustomDuration{Duration: 30 * time.Second}
-	defaultKeepAliveTimeout = config.CustomDuration{Duration: 90 * time.Second}
+	defaultHTTPConnectTimeout        = config.CustomDuration{Duration: 30 * time.Second}
+	defaultWarpRoutingConnectTimeout = config.CustomDuration{Duration: 5 * time.Second}
+	defaultTLSTimeout                = config.CustomDuration{Duration: 10 * time.Second}
+	defaultTCPKeepAlive              = config.CustomDuration{Duration: 30 * time.Second}
+	defaultKeepAliveTimeout          = config.CustomDuration{Duration: 90 * time.Second}
 )
 
 const (
@@ -35,47 +36,90 @@ const (
 	NoChunkedEncodingFlag         = "no-chunked-encoding"
 	ProxyAddressFlag              = "proxy-address"
 	ProxyPortFlag                 = "proxy-port"
+	Http2OriginFlag               = "http2-origin"
 )
 
 const (
 	socksProxy = "socks"
 )
 
+type WarpRoutingConfig struct {
+	Enabled        bool                  `yaml:"enabled" json:"enabled"`
+	ConnectTimeout config.CustomDuration `yaml:"connectTimeout" json:"connectTimeout,omitempty"`
+	TCPKeepAlive   config.CustomDuration `yaml:"tcpKeepAlive" json:"tcpKeepAlive,omitempty"`
+}
+
+func NewWarpRoutingConfig(raw *config.WarpRoutingConfig) WarpRoutingConfig {
+	cfg := WarpRoutingConfig{
+		Enabled:        raw.Enabled,
+		ConnectTimeout: defaultWarpRoutingConnectTimeout,
+		TCPKeepAlive:   defaultTCPKeepAlive,
+	}
+	if raw.ConnectTimeout != nil {
+		cfg.ConnectTimeout = *raw.ConnectTimeout
+	}
+	if raw.TCPKeepAlive != nil {
+		cfg.TCPKeepAlive = *raw.TCPKeepAlive
+	}
+	return cfg
+}
+
+func (c *WarpRoutingConfig) RawConfig() config.WarpRoutingConfig {
+	raw := config.WarpRoutingConfig{
+		Enabled: c.Enabled,
+	}
+	if c.ConnectTimeout.Duration != defaultWarpRoutingConnectTimeout.Duration {
+		raw.ConnectTimeout = &c.ConnectTimeout
+	}
+	if c.TCPKeepAlive.Duration != defaultTCPKeepAlive.Duration {
+		raw.TCPKeepAlive = &c.TCPKeepAlive
+	}
+	return raw
+}
+
 // RemoteConfig models ingress settings that can be managed remotely, for example through the dashboard.
 type RemoteConfig struct {
 	Ingress     Ingress
-	WarpRouting config.WarpRoutingConfig
+	WarpRouting WarpRoutingConfig
 }
 
-type remoteConfigJSON struct {
-	GlobalOriginRequest config.OriginRequestConfig      `json:"originRequest"`
+type RemoteConfigJSON struct {
+	GlobalOriginRequest *config.OriginRequestConfig     `json:"originRequest,omitempty"`
 	IngressRules        []config.UnvalidatedIngressRule `json:"ingress"`
 	WarpRouting         config.WarpRoutingConfig        `json:"warp-routing"`
 }
 
 func (rc *RemoteConfig) UnmarshalJSON(b []byte) error {
-	var rawConfig remoteConfigJSON
+	var rawConfig RemoteConfigJSON
+
 	if err := json.Unmarshal(b, &rawConfig); err != nil {
 		return err
 	}
-	ingress, err := validateIngress(rawConfig.IngressRules, originRequestFromConfig(rawConfig.GlobalOriginRequest))
+
+	// if nil, just assume the default values.
+	globalOriginRequestConfig := rawConfig.GlobalOriginRequest
+	if globalOriginRequestConfig == nil {
+		globalOriginRequestConfig = &config.OriginRequestConfig{}
+	}
+
+	ingress, err := validateIngress(rawConfig.IngressRules, originRequestFromConfig(*globalOriginRequestConfig))
 	if err != nil {
 		return err
 	}
 
 	rc.Ingress = ingress
-	rc.WarpRouting = rawConfig.WarpRouting
+	rc.WarpRouting = NewWarpRoutingConfig(&rawConfig.WarpRouting)
 
 	return nil
 }
 
 func originRequestFromSingeRule(c *cli.Context) OriginRequestConfig {
-	var connectTimeout config.CustomDuration = defaultConnectTimeout
-	var tlsTimeout config.CustomDuration = defaultTLSTimeout
-	var tcpKeepAlive config.CustomDuration = defaultTCPKeepAlive
+	var connectTimeout = defaultHTTPConnectTimeout
+	var tlsTimeout = defaultTLSTimeout
+	var tcpKeepAlive = defaultTCPKeepAlive
 	var noHappyEyeballs bool
-	var keepAliveConnections int = defaultKeepAliveConnections
-	var keepAliveTimeout config.CustomDuration = defaultKeepAliveTimeout
+	var keepAliveConnections = defaultKeepAliveConnections
+	var keepAliveTimeout = defaultKeepAliveTimeout
 	var httpHostHeader string
 	var originServerName string
 	var caPool string
@@ -85,6 +129,7 @@ func originRequestFromSingeRule(c *cli.Context) OriginRequestConfig {
 	var proxyAddress = defaultProxyAddress
 	var proxyPort uint
 	var proxyType string
+	var http2Origin bool
 	if flag := ProxyConnectTimeoutFlag; c.IsSet(flag) {
 		connectTimeout = config.CustomDuration{Duration: c.Duration(flag)}
 	}
@@ -128,9 +173,13 @@ func originRequestFromSingeRule(c *cli.Context) OriginRequestConfig {
 		// Note TUN-3758 , we use Int because UInt is not supported with altsrc
 		proxyPort = uint(c.Int(flag))
 	}
+	if flag := Http2OriginFlag; c.IsSet(flag) {
+		http2Origin = c.Bool(flag)
+	}
 	if c.IsSet(Socks5Flag) {
 		proxyType = socksProxy
 	}
+
 	return OriginRequestConfig{
 		ConnectTimeout:         connectTimeout,
 		TLSTimeout:             tlsTimeout,
@@ -147,12 +196,13 @@ func originRequestFromSingeRule(c *cli.Context) OriginRequestConfig {
 		ProxyAddress:           proxyAddress,
 		ProxyPort:              proxyPort,
 		ProxyType:              proxyType,
+		Http2Origin:            http2Origin,
 	}
 }
 
 func originRequestFromConfig(c config.OriginRequestConfig) OriginRequestConfig {
 	out := OriginRequestConfig{
-		ConnectTimeout:       defaultConnectTimeout,
+		ConnectTimeout:       defaultHTTPConnectTimeout,
 		TLSTimeout:           defaultTLSTimeout,
 		TCPKeepAlive:         defaultTCPKeepAlive,
 		KeepAliveConnections: defaultKeepAliveConnections,
@@ -212,6 +262,9 @@ func originRequestFromConfig(c config.OriginRequestConfig) OriginRequestConfig {
 			}
 		}
 	}
+	if c.Http2Origin != nil {
+		out.Http2Origin = *c.Http2Origin
+	}
 	return out
 }
 
@@ -255,6 +308,8 @@ type OriginRequestConfig struct {
 	ProxyType string `yaml:"proxyType" json:"proxyType"`
 	// IP rules for the proxy service
 	IPRules []ipaccess.Rule `yaml:"ipRules" json:"ipRules"`
+	// Attempt to connect to origin with HTTP/2
+	Http2Origin bool `yaml:"http2Origin" json:"http2Origin"`
 }
 
 func (defaults *OriginRequestConfig) setConnectTimeout(overrides config.OriginRequestConfig) {
@@ -360,6 +415,12 @@ func (defaults *OriginRequestConfig) setIPRules(overrides config.OriginRequestCo
 	}
 }
 
+func (defaults *OriginRequestConfig) setHttp2Origin(overrides config.OriginRequestConfig) {
+	if val := overrides.Http2Origin; val != nil {
+		defaults.Http2Origin = *val
+	}
+}
+
 // SetConfig gets config for the requests that cloudflared sends to origins.
 // Each field has a setter method which sets a value for the field by trying to find:
 //   1. The user config for this rule
@@ -385,5 +446,95 @@ func setConfig(defaults OriginRequestConfig, overrides config.OriginRequestConfi
 	cfg.setProxyAddress(overrides)
 	cfg.setProxyType(overrides)
 	cfg.setIPRules(overrides)
+	cfg.setHttp2Origin(overrides)
 	return cfg
+}
+
+func ConvertToRawOriginConfig(c OriginRequestConfig) config.OriginRequestConfig {
+	var connectTimeout *config.CustomDuration
+	var tlsTimeout *config.CustomDuration
+	var tcpKeepAlive *config.CustomDuration
+	var keepAliveConnections *int
+	var keepAliveTimeout *config.CustomDuration
+	var proxyAddress *string
+
+	if c.ConnectTimeout != defaultHTTPConnectTimeout {
+		connectTimeout = &c.ConnectTimeout
+	}
+	if c.TLSTimeout != defaultTLSTimeout {
+		tlsTimeout = &c.TLSTimeout
+	}
+	if c.TCPKeepAlive != defaultTCPKeepAlive {
+		tcpKeepAlive = &c.TCPKeepAlive
+	}
+	if c.KeepAliveConnections != defaultKeepAliveConnections {
+		keepAliveConnections = &c.KeepAliveConnections
+	}
+	if c.KeepAliveTimeout != defaultKeepAliveTimeout {
+		keepAliveTimeout = &c.KeepAliveTimeout
+	}
+	if c.ProxyAddress != defaultProxyAddress {
+		proxyAddress = &c.ProxyAddress
+	}
+
+	return config.OriginRequestConfig{
+		ConnectTimeout:         connectTimeout,
+		TLSTimeout:             tlsTimeout,
+		TCPKeepAlive:           tcpKeepAlive,
+		NoHappyEyeballs:        defaultBoolToNil(c.NoHappyEyeballs),
+		KeepAliveConnections:   keepAliveConnections,
+		KeepAliveTimeout:       keepAliveTimeout,
+		HTTPHostHeader:         emptyStringToNil(c.HTTPHostHeader),
+		OriginServerName:       emptyStringToNil(c.OriginServerName),
+		CAPool:                 emptyStringToNil(c.CAPool),
+		NoTLSVerify:            defaultBoolToNil(c.NoTLSVerify),
+		DisableChunkedEncoding: defaultBoolToNil(c.DisableChunkedEncoding),
+		BastionMode:            defaultBoolToNil(c.BastionMode),
+		ProxyAddress:           proxyAddress,
+		ProxyPort:              zeroUIntToNil(c.ProxyPort),
+		ProxyType:              emptyStringToNil(c.ProxyType),
+		IPRules:                convertToRawIPRules(c.IPRules),
+		Http2Origin:            defaultBoolToNil(c.Http2Origin),
+	}
+}
+
+func convertToRawIPRules(ipRules []ipaccess.Rule) []config.IngressIPRule {
+	result := make([]config.IngressIPRule, 0)
+	for _, r := range ipRules {
+		cidr := r.StringCIDR()
+
+		newRule := config.IngressIPRule{
+			Prefix: &cidr,
+			Ports:  r.Ports(),
+			Allow:  r.RulePolicy(),
+		}
+
+		result = append(result, newRule)
+	}
+
+	return result
+}
+
+func defaultBoolToNil(b bool) *bool {
+	if b == false {
+		return nil
+	}
+
+	return &b
+}
+
+func emptyStringToNil(s string) *string {
+	if s == "" {
+		return nil
+	}
+
+	return &s
+}
+
+func zeroUIntToNil(v uint) *uint {
+	if v == 0 {
+		return nil
+	}
+
+	return &v
 }

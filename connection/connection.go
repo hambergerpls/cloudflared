@@ -30,6 +30,7 @@ var switchingProtocolText = fmt.Sprintf("%d %s", http.StatusSwitchingProtocols, 
 
 type Orchestrator interface {
 	UpdateConfig(version int32, config []byte) *pogs.UpdateConfigurationResponse
+	GetConfigJSON() ([]byte, error)
 	GetOriginProxy() (OriginProxy, error)
 }
 
@@ -131,6 +132,7 @@ type TCPRequest struct {
 	Dest    string
 	CFRay   string
 	LBProbe bool
+	FlowID  string
 }
 
 // ReadWriteAcker is a readwriter with the ability to Acknowledge to the downstream (edge) that the origin has
